@@ -55,7 +55,7 @@ if st.session_state.get("update_clicked", False):
             st.error("Weights must sum to 1.0")
             st.stop()
 
-        data = yf.download(tickers, start='2020-01-01', progress=False)['Adj Close']
+        data = yf.download(tickers, start='2020-01-01', progress=False)['Close']
         if isinstance(data, pd.Series):
             data = data.to_frame(name=tickers[0])
         
