@@ -1,93 +1,193 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import matplotlib.pyplot as plt
-from scipy.stats import norm
+import plotly.graph_objects as go
+from pathlib import Path
+import appdirs as ad
+from datetime import datetime
 
-# ================== 1. Portfolio Setup (FRTB-style Trading Desk) ==================
-tickers = ['AAPL', 'MSFT', 'GOOGL', 'JPM', 'TSLA']   # Example desk
-weights = np.array([0.25, 0.25, 0.20, 0.15, 0.15])
+# ====================== IMPORTANT FIX FOR STREAMLIT CLOUD ======================
+# This prevents yfinance cache errors on Streamlit Cloud
+ad.user_cache_dir = lambda *args: "/tmp"
+Path("/tmp").mkdir(exist_ok=True)
+# ===============================================================================
 
-# FRTB Liquidity Horizon Buckets (in days) - official BCBS mapping example
-liquidity_horizons = {
-    'AAPL': 10,   # Large-cap equity → Bucket 1
-    'MSFT': 10,
-    'GOOGL': 10,
-    'JPM': 20,    # Bank equity → Bucket 2
-    'TSLA': 40    # High-volatility equity → Bucket 3
-}
+st.set_page_config(
+    page_title="FRTB IMA Dashboard",
+    page_icon="🚀",
+    layout="wide"
+)
 
-data = yf.download(tickers, start='2024-04-09', end='2026-04-09',progress=False)['Close']
-returns = data.pct_change().dropna()
+st.title("🚀 FRTB Internal Models Approach (IMA) Dashboard")
+st.markdown("**Liquidity-Adjusted Expected Shortfall (97.5%)** | Historical Simulation Shortcut")
 
-portfolio_returns = returns.dot(weights)   # Daily portfolio returns
-
-print(f"Portfolio data: {len(portfolio_returns)} days | From {portfolio_returns.index[0].date()}")
-
-# ================== 2. FRTB Liquidity-Adjusted Expected Shortfall ==================
-def frtb_liquidity_adjusted_es(returns_series, window=252, confidence=0.975):
-    """Shortcut FRTB IMA: Historical ES + Liquidity Horizon Scaling"""
-    es_series = pd.Series(index=returns_series.index, dtype=float)
-    var_series = pd.Series(index=returns_series.index, dtype=float)  # for backtesting
+# ================== Sidebar Controls ==================
+with st.sidebar:
+    st.header("Portfolio Configuration")
     
-    for i in range(window, len(returns_series)):
-        hist_returns = returns_series.iloc[i-window:i]
-        
-        # Step 1: Base 1-day ES (97.5%)
-        losses = -hist_returns.values
-        var_1d = np.percentile(losses, (1 - confidence) * 100)
-        es_1d = losses[losses >= var_1d].mean() if len(losses[losses >= var_1d]) > 0 else var_1d
-        
-        # Step 2: Liquidity Horizon Scaling (FRTB official nested formula - simplified)
-        # We scale each asset's contribution by sqrt(LH / 10)
-        scaled_losses = np.zeros(len(hist_returns))
-        for asset, w in zip(returns.columns, weights):
-            lh = liquidity_horizons.get(asset, 10)          # default 10 days
-            asset_returns = returns[asset].iloc[i-window:i]
-            scaled = asset_returns * w * np.sqrt(lh / 10.0)   # FRTB scaling factor
-            scaled_losses += -scaled.values
-        
-        # Final liquidity-adjusted ES
-        es_liquidity = scaled_losses[scaled_losses >= np.percentile(scaled_losses, (1-confidence)*100)].mean()
-        
-        es_series.iloc[i] = es_liquidity
-        var_series.iloc[i] = var_1d * np.sqrt(10)  # 10-day VaR for reference
+    tickers_input = st.text_input(
+        "Tickers (comma separated)",
+        value="AAPL, MSFT, GOOGL, JPM, TSLA"
+    )
     
-    return es_series, var_series
-
-# Calculate
-es_97_5, var_10d = frtb_liquidity_adjusted_es(portfolio_returns, window=252)
-
-# ================== 3. Plot Results ==================
-plt.figure(figsize=(14, 7))
-plt.plot(portfolio_returns.index, -portfolio_returns * 100, label='Actual Daily Loss (%)', color='gray', alpha=0.6)
-plt.plot(es_97_5.index, es_97_5 * 100, label='FRTB 97.5% Liquidity-Adjusted ES (%)', color='red', linewidth=2)
-plt.title('Shortcut FRTB IMA: Liquidity-Adjusted Expected Shortfall (97.5%)')
-plt.ylabel('Loss (%)')
-plt.legend()
-plt.grid(True)
-plt.show()
-
-# ================== 4. Simple Backtesting (Basel-style + ES check) ==================
-def frtb_backtest(es_series, actual_returns, window=252):
-    test_es = es_series.dropna()
-    test_actual = -actual_returns[-len(test_es):]
+    weights_input = st.text_input(
+        "Weights (comma separated - must sum to 1)",
+        value="0.25, 0.25, 0.20, 0.15, 0.15"
+    )
     
-    exceptions = (test_actual > test_es).sum()
-    n = len(test_es)
-    expected_exceptions = (1 - 0.975) * n
+    window = st.slider(
+        "Lookback Window (days)", 
+        min_value=126, 
+        max_value=504, 
+        value=252, 
+        step=1
+    )
     
-    print("\n=== FRTB IMA Backtesting Results ===")
-    print(f"Observations tested     : {n}")
-    print(f"Exceptions (breaches)   : {exceptions} (expected ≈ {expected_exceptions:.1f})")
-    print(f"Exception rate          : {exceptions/n*100:.2f}%")
-    print("Zone (simplified):", "GREEN" if exceptions <= 0.05*n else "YELLOW" if exceptions <= 0.10*n else "RED")
+    confidence = st.selectbox(
+        "Confidence Level",
+        options=[0.95, 0.975, 0.99],
+        format_func=lambda x: f"{x*100:.1f}%",
+        index=1
+    )
+    
+    lh_multiplier = st.slider(
+        "Liquidity Horizon Multiplier", 
+        min_value=0.5, 
+        max_value=3.0, 
+        value=1.0, 
+        step=0.1
+    )
+    
+    update_button = st.button("🔄 Update Dashboard", type="primary")
 
-frtb_backtest(es_97_5, portfolio_returns)
+# ================== FRTB Calculation Function ==================
+def calculate_frtb_es(returns, weights, lh_dict, window=252, confidence=0.975, lh_mult=1.0):
+    es_list = []
+    dates = []
+    
+    for i in range(window, len(returns)):
+        hist = returns.iloc[i - window:i]
+        dates.append(returns.index[i])
+        
+        # Liquidity-adjusted scaled losses
+        scaled_losses = np.zeros(len(hist))
+        for j, asset in enumerate(returns.columns):
+            lh = lh_dict.get(asset, 10) * lh_mult
+            scaled_losses += -hist[asset].values * weights[j] * np.sqrt(lh / 10.0)
+        
+        # Calculate Expected Shortfall
+        threshold = np.percentile(scaled_losses, (1 - confidence) * 100)
+        tail_losses = scaled_losses[scaled_losses >= threshold]
+        es_val = tail_losses.mean() if len(tail_losses) > 0 else threshold
+        
+        es_list.append(es_val)
+    
+    return pd.Series(es_list, index=dates)
 
-# ================== 5. Sensitivity Analysis ==================
-print("\nSensitivity to Liquidity Horizons:")
-for factor in [1.0, 1.5, 2.0]:
-    # Quick re-run with multiplied horizons
-    temp_es = frtb_liquidity_adjusted_es(portfolio_returns, window=252)[0].dropna().mean() * factor
-    print(f"Liquidity multiplier ×{factor} → Avg ES = {temp_es*100:.2f}%")
+# ================== Main App Logic ==================
+if update_button:
+    try:
+        # Parse inputs
+        tickers = [t.strip().upper() for t in tickers_input.split(',')]
+        weights = np.array([float(w.strip()) for w in weights_input.split(',')])
+        
+        if len(tickers) != len(weights):
+            st.error("❌ Number of tickers and weights must be the same!")
+            st.stop()
+        
+        if abs(weights.sum() - 1.0) > 0.02:
+            st.warning("⚠️ Weights should sum to approximately 1.0")
+
+        # Download data
+        with st.spinner("Downloading market data..."):
+            data = yf.download(tickers, start='2020-01-01', progress=False)['Adj Close']
+        
+        # Handle single ticker case
+        if isinstance(data, pd.Series):
+            data = data.to_frame(name=tickers[0])
+        
+        returns = data.pct_change().dropna()
+        portfolio_returns = returns.dot(weights)
+
+        # Define Liquidity Horizons
+        lh_dict = {ticker: 10 if i < 3 else 20 if i < 4 else 40 
+                  for i, ticker in enumerate(tickers)}
+
+        # Calculate FRTB ES
+        es_series = calculate_frtb_es(returns, weights, lh_dict, window, confidence, lh_multiplier)
+
+        # ================== Display Results ==================
+        col1, col2 = st.columns([3, 1])
+
+        with col1:
+            st.subheader("FRTB Liquidity-Adjusted Expected Shortfall vs Actual Losses")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=portfolio_returns.index, 
+                y=-portfolio_returns * 100,
+                name='Actual Daily Loss (%)',
+                line=dict(color='lightgray', width=1)
+            ))
+            fig.add_trace(go.Scatter(
+                x=es_series.index, 
+                y=es_series * 100,
+                name=f'{confidence*100:.1f}% FRTB ES',
+                line=dict(color='red', width=3)
+            ))
+            fig.update_layout(
+                height=650,
+                template="plotly_dark",
+                xaxis_title="Date",
+                yaxis_title="Loss (%)",
+                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            st.subheader("Backtesting Summary")
+            test_es = es_series.dropna()
+            test_actual = -portfolio_returns[-len(test_es):]
+            exceptions = (test_actual > test_es).sum()
+            n = len(test_es)
+            exception_rate = (exceptions / n * 100) if n > 0 else 0
+            
+            zone_color = "🟢 GREEN" if exception_rate <= 5 else "🟡 YELLOW" if exception_rate <= 10 else "🔴 RED"
+            
+            st.metric("Observations", f"{n:,}")
+            st.metric("Exceptions", f"{exceptions} ({exception_rate:.2f}%)")
+            st.metric("Backtesting Zone", zone_color)
+            st.metric("Average ES", f"{es_series.mean()*100:.2f}%")
+            st.metric("Maximum ES", f"{es_series.max()*100:.2f}%")
+
+        # Sensitivity Analysis
+        st.subheader("Sensitivity to Liquidity Horizon Multiplier")
+        multipliers = [0.5, 1.0, 1.5, 2.0, 2.5]
+        avg_es_values = []
+        
+        for m in multipliers:
+            temp_es = calculate_frtb_es(returns, weights, lh_dict, window, confidence, m)
+            avg_es_values.append(temp_es.mean() * 100)
+        
+        sens_fig = go.Figure()
+        sens_fig.add_trace(go.Bar(
+            x=[f"{m}x" for m in multipliers],
+            y=avg_es_values,
+            marker_color='royalblue'
+        ))
+        sens_fig.update_layout(
+            height=400,
+            template="plotly_dark",
+            xaxis_title="Liquidity Horizon Multiplier",
+            yaxis_title="Average ES (%)"
+        )
+        st.plotly_chart(sens_fig, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"❌ Error: {str(e)}")
+        st.info("💡 Tip: Make sure tickers are valid and weights sum to 1.0")
+
+else:
+    st.info("👈 Please configure your portfolio in the sidebar and click **Update Dashboard**")
+
+st.caption("FRTB Shortcut Dashboard | Liquidity-Adjusted Expected Shortfall (97.5%) | Fixed for Streamlit Cloud")
